@@ -50,7 +50,7 @@ Before first run, download the required model files (Silero VAD, turn detector):
 
 ```bash
 # Download model files for basic agent
-uv run python livekit_basic_agent.py download-files
+uv run python symrax_agent.py download-files
 
 # Download model files for MCP agent
 uv run python livekit_mcp_agent.py download-files
@@ -60,16 +60,16 @@ uv run python livekit_mcp_agent.py download-files
 
 ```bash
 # Basic agent (minimal configuration)
-uv run python livekit_basic_agent.py console
+uv run python symrax_agent.py console
 
 # MCP agent (with MCP server integration)
 uv run python livekit_mcp_agent.py console
 
 # Development mode (connects to LiveKit - optional)
-uv run python livekit_basic_agent.py dev
+uv run python symrax_agent.py dev
 
 # Production mode
-uv run python livekit_basic_agent.py start
+uv run python symrax_agent.py start
 ```
 
 ## Architecture
@@ -92,7 +92,7 @@ uv run python livekit_basic_agent.py start
 
 ### Basic Agent
 
-**`livekit_basic_agent.py`** - The simplest possible LiveKit voice agent
+**`symrax_agent.py`** - The simplest possible LiveKit voice agent
 - Minimal configuration with only essential components
 - Great for learning and testing basic functionality
 - Requires only OpenAI and Deepgram API keys
@@ -239,7 +239,7 @@ This will write your LiveKit credentials to `.env.local`
 Run your agent connected to LiveKit Cloud:
 
 ```bash
-uv run python livekit_basic_agent.py start
+uv run python symrax_agent.py start
 ```
 
 ### 6. Create an Agent in LiveKit Cloud
