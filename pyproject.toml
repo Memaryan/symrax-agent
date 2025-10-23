@@ -11,6 +11,9 @@ dependencies = [
     "livekit-plugins-silero>=1.0.0",
     "livekit-plugins-turn-detector>=1.0.0",
     "python-dotenv>=1.0.0",
+    "livekit-plugins-anthropic>=1.2.14",
+    "livekit-plugins-google>=1.2.14",
+    "livekit-plugins-groq>=1.2.14",
 ]
 
 [project.optional-dependencies]
