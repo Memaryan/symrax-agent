@@ -263,10 +263,13 @@ class Assistant(Agent):
     async def get_current_date_and_time(self, context: RunContext) -> str:
         """Get the current date and time."""
         toronto_tz = pytz.timezone('America/Toronto')
-        current_datetime = datetime.now(toronto_tz).strftime("%B %d, %Y, %I:%M %p")
-        logger.info(f"Current date and time in Toronto: {current_datetime}")
-        # '%b %d, %Y %I:%M %p'
-        return f"The current date and time is {current_datetime}"       
+        current_datetime = datetime.now(toronto_tz)
+        
+        # Format with day name, date, and time
+        formatted_datetime = current_datetime.strftime("%A, %B %d, %Y at %I:%M %p")
+        logger.info(f"Current date and time in Toronto: {formatted_datetime}")
+        
+        return f"The current date and time is {formatted_datetime}"    
 
     @function_tool
     async def get_slot(self, appointmentType: str, bookingDate: str = next_business_day, bookingTime: str = "09:00") -> str:
