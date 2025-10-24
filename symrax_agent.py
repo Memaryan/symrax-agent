@@ -1,119 +1,194 @@
-from datetime import datetime, timedelta
-import pytz
 import logging
-import aiohttp
+from datetime import datetime
 import asyncio
+import aiohttp
+import pytz
 from dotenv import load_dotenv
-from livekit import rtc
-from livekit import agents
 from livekit.agents import (
-    NOT_GIVEN,
     Agent,
-    AgentFalseInterruptionEvent,
     AgentSession,
     JobContext,
-    JobProcess,
-    MetricsCollectedEvent,
-    ModelSettings,
-    RoomInputOptions,
-    RoomOutputOptions,
-    RunContext,
     WorkerOptions,
     cli,
-    metrics,
-    mcp
+    function_tool,
+    RoomInputOptions
 )
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
-from livekit.agents.llm import function_tool
-from livekit.plugins import openai, silero, google, noise_cancellation
+from livekit.plugins import openai, silero, noise_cancellation
 from openai.types.beta.realtime.session import TurnDetection
 
-# Load environment variables
-load_dotenv(".env")
+load_dotenv('.env')
+logger = logging.getLogger("harmony_agent")
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# --- Harmony Fertility Webhook Tools ---
+class HarmonyTools:
+    def __init__(self, phoneNum):
+        self.phoneNum = self._clean_phone_number(phoneNum)
+        self.webhook_url = "https://n8n.srv891045.hstgr.cloud/webhook/harmony"
 
-def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
+    def _clean_phone_number(self, phone_num: str) -> str:
+        if phone_num == "mock_user":
+            return "4168398090"
+        if phone_num.startswith('sip_'):
+            phone_num = phone_num[4:]
+        cleaned = ''.join(c for c in phone_num if c.isdigit() or c == '+')
+        return cleaned
 
-# Function to get the next business day
-def get_next_business_day():
-    """Get the next business day (Mon-Fri), skipping weekends"""
-    toronto_tz = pytz.timezone('America/Toronto')
-    tomorrow = datetime.now(toronto_tz) + timedelta(days=1)
+    @function_tool
+    async def get_slot(self, appointmentType: str, bookingDate: str = "false", bookingTime: str = "false") -> str:
+        """Check appointment availability for specified type, date and time."""
+        payload = {
+            "action": "get_slot",
+            "appointmentType": appointmentType,
+            "bookingDate": bookingDate,
+            "bookingTime": bookingTime,
+            "phoneNumber": self.phoneNum
+        }
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(self.webhook_url, json=payload) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        result = data.get("result", "No availability data received")
+                        logger.info(f"✅ Webhook get_slot completed: {result}")
+                        return result
+                    
+                    logger.warning(f"Webhook error: {response.status} for get_slot")
+                    return "Sorry, I'm having trouble checking availability right now."
+                
+        except asyncio.TimeoutError:
+            logger.error("Webhook timeout for get_slot")
+            return "The availability system is temporarily slow to respond."
+        except Exception as e:
+            logger.exception(f"Webhook call failed for get_slot: {e}")
+            return "The availability system is temporarily unavailable."
+
+async def entrypoint(ctx: JobContext):
+    """Main entry point for the telephony voice agent."""
+    await ctx.connect()
+
+    # Wait for participant (caller) to join and get their phone number
+    participant = await ctx.wait_for_participant()
+    caller_id = participant.identity
+    logger.info(f"Phone call connected from: {caller_id}")
+
+    # Enhanced check for unknown/blocked caller ID
+    unknown_patterns = [
+        "", "unknown", "anonymous", "private", "restricted", "unavailable", "blocked",
+        "sip_unavailable", "sip_unknown", "sip_anonymous", "sip_private", "sip_restricted", "sip_blocked"
+    ]
     
-    # Check if tomorrow is Saturday (5) or Sunday (6)
-    while tomorrow.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
-        tomorrow += timedelta(days=1)
+    caller_id_lower = caller_id.lower() if caller_id else ""
+    is_unknown = (
+        not caller_id or 
+        (caller_id.strip() == "" if caller_id else True) or 
+        caller_id_lower in unknown_patterns or
+        "unavailable" in caller_id_lower or
+        "unknown" in caller_id_lower or
+        "anonymous" in caller_id_lower or
+        "private" in caller_id_lower or
+        "restricted" in caller_id_lower or
+        "blocked" in caller_id_lower
+    )
     
-    return tomorrow.strftime("%Y-%m-%d")
-
-# Get the next business day for default parameter
-next_business_day = get_next_business_day()
-
-class Assistant(Agent):
-    """Main voice assistant implementation."""
-    
-    def __init__(self):
-        super().__init__(
-            instructions="""     
-        ## Identity & Purpose
-        You are Kristine, the AI front desk assistant for Harmony Fertility Clinic. Your role is to help patients with answering general questions about our services. All appointments are in-person only with Dr. Peyman Mazidi.
+    if is_unknown:
+        logger.warning(f"Unknown caller detected: '{caller_id}' - rejecting call")
+        try:
+            agent = Agent(
+                instructions="You are a rejection system. Say exactly: 'We're sorry, but we cannot assist calls from unknown or private numbers. Please call back from a recognized phone number.' Then end the call.",
+            )
+            
+            session = AgentSession(
+                vad=silero.VAD.load(),
+                llm=openai.realtime.RealtimeModel(
+                    model="gpt-4o-mini-realtime-preview",
+                    voice="shimmer", 
+                    temperature=0.7,
+                    turn_detection=TurnDetection(
+                        type="server_vad",
+                        threshold=1,
+                        silence_duration_ms=100,
+                        prefix_padding_ms=100,
+                        create_response=True,
+                        interrupt_response=False,
+                    )
+                ),
+            )
+            
+            await session.start(agent=agent, room=ctx.room)
+            await session.generate_reply(instructions="")
         
-        ## Communication Characteristics
-        - **CONCISE**: 1 sentence responses maximum
-        - **CLEAR**: Speak slowly and enunciate
-        - **PROFESSIONAL**: Maintain compassionate, professional tone
-        - **PATIENT**: Allow natural pauses in conversation
-        - **DIRECT**: Get straight to the point without filler words
+        except Exception as e:
+            logger.error(f"Rejection error: {e}")
+        finally:
+            await ctx.room.disconnect()
+            return
 
-        ## Date & Time Reading Instructions
+    # Initialize tools with the caller's phone number
+    harmony_tools = HarmonyTools(phoneNum=caller_id)
+
+    # Static time - calculated once when agent starts
+    toronto_tz = pytz.timezone('America/Toronto')
+    current_time_toronto = datetime.now(toronto_tz)
+    formatted_time = current_time_toronto.strftime('%b %d, %Y %I:%M %p')
+
+    # Initialize the conversational agent with simplified instructions
+    agent = Agent(
+        instructions=f"""# Harmony Fertility AI Assistant
+
+        ## Identity & Purpose
+        You are Kristine, the front desk assistant for Harmony Fertility Clinic. Your role is to help patients with general questions about our services.
+
+        ## Current Time
+        The current time and date are {formatted_time} in Toronto, Canada.
+
+        ## Date & Time Reading
         **WHEN READING DATES AND TIMES:**
-        - Read slowly with natural pauses between components
-        - Example: "September twenty-two at three-thirty" (not "2025-09-22 at 3:30")
-        - Always use natural language appropriate to the current language
+        - Read slowly with natural pauses
+        - Example: "September twenty-two at three-thirty"
         - Speak numbers as words, not digits
-
-        ## Language Handling
-        - Automatically detect and respond in the user's language without being asked
-        - If user switches languages, immediately switch with them
-        - No need for language confirmation - just respond naturally in their language
-        - Maintain professional tone in all languages
-        - Apply natural date/time reading rules to all languages
-
-        ## Core Rules
-        - **AUTOMATIC LANGUAGE DETECTION**: Automatically respond in the same language the user speaks to you in. No need for keywords or prompts.
-        - **FUNCTION EXECUTION**: Silently call functions when needed - never say function names out loud or explain you're calling them
-        - **NO HALLUCINATION**: Only use information from the knowledge base. If you don't know something, direct to live agent
-        - **PHONE NUMBER FORMAT**: Always read numbers digit-by-digit slowly and clearly (e.g. two-eight-nine five-seven-zero one-zero-seven-zero)
-        - **DATE/TIME FORMAT**: Read dates naturally with pauses: "It is September twenty-two, twenty-twenty-five at three-thirty"
-        - **OUT OF OPERATING DAYS/HOURS** : If user asks for appointment outside of Mon-Fri 9am-5pm, inform them the clinic is closed. Only saturday and sunday are closed.
-        - **ALWAYS PASS PARAMETERS*: When calling functions, always provide all required parameters.
-        - **CALENDAR TYPE**: Use Gregorian calendar for all date references.
-        - **FUCNTION PARAMETERS**: Always ensure function parameters are in English, even if user is speaking another language.
-        - **CALENDAR DATES**: Always check 'get_current_date_and_time' against user's requested booking date. User may say wrong date, so verify with calendar date.
-
-        ## Functions
-        - Use `get_current_date_and_time` to provide the current date and time in Toronto, Canada
-        • Required inputs: None
-        - Use `get_slot` to check appointment availability when booking is requested
-        • Required inputs: 'appointmentType', 'bookingDate', 'bookingTime' (bookingDate converted & passed as "yyyy-mm-dd" format. bookingTime as "HH:MM" 24-hour format)
+        - Use natural language appropriate to the current language
 
         ## Initial Greeting
         **ALWAYS START WITH:** "Thank you for calling Harmony Fertility. This is Kristine. I can help with general questions about our services. I can assist you in any language you prefer."
 
-        ## Critical Function Rules
-        - **ALWAYS ASK APPOINTMENT TYPE** even if user mentions it initially
-        - **REMEMBER** appointment type throughout conversation - don't ask again after confirmation
-        - **ALWAYS** specify `appointmentType` (Consultation, Follow-up, Ultrasound)
-        - **NEVER** ask for phone/email - ignore if provided
-        - **NEVER** mention eventID or technical systems
-        - **REMEMBER** get_slot returns availability & if date/time is outisde working hours
-        - **ALWAYS** call get_slot every time user suggests a date/time for appointment
-        - **NEVER** suggest date/time without calling get_slot first
-        - **REMEMBER** if user's requested date/time is in the past, give a friendly joke about scheduling in the past
+        ## Core Rules
+        - **AUTOMATIC LANGUAGE DETECTION**: Automatically respond in the same language the user speaks to you in
+        - **FUNCTION EXECUTION**: Silently call functions when needed - never say function names out loud
+        - **NO HALLUCINATION**: Only use information from the knowledge base
+        - **PHONE NUMBER FORMAT**: Always read numbers digit-by-digit slowly and clearly
+        - **DATE/TIME FORMAT**: Read dates naturally with pauses
+        - **NEVER SUGGEST TIMES**: Only suggest times returned by get_slot function
+        - **FUNCTION CALLING**: Always call get_slot every time user asks for a date/time availability
+
+        ## Communication Characteristics
+        - **CONCISE**: 1-2 sentence responses maximum
+        - **CLEAR**: Speak slowly and enunciate
+        - **PROFESSIONAL**: Maintain compassionate, professional tone
+        - **PATIENT**: Allow natural pauses in conversation
+
+        ## Language Handling
+        - Automatically detect and respond in the user's language
+        - If user switches languages, immediately switch with them
+        - No need for language confirmation
+
+        ## get_slot Function Rules
+        **CRITICAL RULES:**
+        - **ALWAYS ASK APPOINTMENT TYPE** first: "What type of appointment?"
+        - **ACCEPT ANY DATE/TIME INPUT**: Call get_slot with whatever date/time user provides
+        - **TIME ONLY NOT ALLOWED**: If user gives only time, ask "What date would you like?"
+
+        **PARAMETER FORMATS:**
+        - `appointmentType`: Consultation, Follow-up, or Ultrasound
+        - `bookingDate`: "yyyy-mm-dd" format or "false"
+        - `bookingTime`: "HH:MM" 24-hour format or "false"
+
+        **FUNCTION BEHAVIOR:**
+        - Call get_slot silently with ANY date/time user provides
+        - Use EXACTLY what get_slot returns - never modify or interpret
+        - Never check operating hours yourself - get_slot handles this automatically
+        - If get_slot returns no availability, ask user for different date/time
 
         # Harmony Fertility Knowledge Base
         ## 1. General Information
@@ -256,130 +331,48 @@ class Assistant(Agent):
         ## 7. Legal & Compliance
         - Patient data is managed in compliance with Ontario health privacy regulations.  
         - All fertility and pregnancy treatments follow current medical guidelines and standards.  
-        - Patients must provide consent before undergoing procedures."""
-        )
+        - Patients must provide consent before undergoing procedures.""",
+        tools=[
+            harmony_tools.get_slot, 
+            ],
+    )
 
-    @function_tool
-    async def get_current_date_and_time(self, context: RunContext) -> str:
-        """Get the current date and time."""
-        toronto_tz = pytz.timezone('America/Toronto')
-        current_datetime = datetime.now(toronto_tz)
-        
-        # Format with day name, date, and time
-        formatted_datetime = current_datetime.strftime("%A, %B %d, %Y at %I:%M %p")
-        logger.info(f"Current date and time in Toronto: {formatted_datetime}")
-        
-        return f"The current date and time is {formatted_datetime}"    
-
-    @function_tool
-    async def get_slot(self, appointmentType: str, bookingDate: str = next_business_day, bookingTime: str = "09:00") -> str:
-        """Get available appointment slots for the specified type and optional preferred date."""
-        webhook_url = "https://n8n.srv891045.hstgr.cloud/webhook/getslots"
-        
-        payload = {
-            "action": "get_slot",
-            "appointmentType": appointmentType,
-            "bookingDate": bookingDate,
-            "bookingTime": bookingTime,
-            "Phone Number": "4168398090"
-        }
-        
-        try:
-            timeout = aiohttp.ClientTimeout(total=10)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(webhook_url, json=payload) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        result = data.get("result", "No availability data received")
-                        logger.info(f"✅ Webhook get_slot completed: {result}")
-                        return result
-                    else:
-                        logger.warning(f"Webhook error: {response.status} for get_slot")
-                        return "Sorry, I'm having trouble checking availability right now."
-                        
-        except asyncio.TimeoutError:
-            logger.error("Webhook timeout for get_slot")
-            return "The availability system is temporarily slow to respond."
-        except Exception as e:
-            logger.exception(f"Webhook call failed for get_slot: {e}")
-            return "The availability system is temporarily unavailable."
-    
-
-    async def on_enter(self):
-        """Called when the agent becomes active."""
-        logger.info("Agent session started")
-        
-        # Generate initial greeting
-        await self.session.generate_reply(
-            instructions=""
-        )
-    
-    async def on_exit(self):
-        """Called when the agent session ends."""
-        logger.info("Agent session ended")
-
-
-async def entrypoint(ctx: agents.JobContext):
-    """Main entry point for the agent worker."""
-    
-    logger.info(f"Agent started in room: {ctx.room.name}")
-    
-    # Configure the voice pipeline
+    # Configure the voice processing pipeline
     session = AgentSession(
-
-        # Open AI realtimeModel
+        vad=silero.VAD.load(),
         llm=openai.realtime.RealtimeModel(
             model="gpt-4o-mini-realtime-preview",
             voice="shimmer",
             temperature=0.7,
-            turn_detection=TurnDetection(  # Configure turn detection here
+            turn_detection=TurnDetection(
                 type="server_vad",
-                threshold=0.9,  # Higher value = less sensitive. Requires louder audio to activate. Good for noisy environments.
-                silence_duration_ms=1500,  # Increase this to be more "patient" and wait longer before considering the user done.
+                threshold=0.9,
+                silence_duration_ms=1500,
                 prefix_padding_ms=300,
                 create_response=True,
                 interrupt_response=True,
             )
         ),
-    
-        
-        # Voice Activity Detection
-        vad=silero.VAD.load(),
-        
-        # Turn detection strategy
-        turn_detection=MultilingualModel(),
     )
-    
-    # Start the session
+
+    # Start the agent session with noise cancellation
     await session.start(
-        room=ctx.room,
-        agent=Assistant(),
+        agent=agent, 
+        room=ctx.room, 
         room_input_options=RoomInputOptions(
-            #Enable noise cancellation
             noise_cancellation=noise_cancellation.BVCTelephony(),
-            # Or noise_cancellation.BVC()
-        ),
-        room_output_options=RoomOutputOptions(transcription_enabled=True),
+        )
     )
-    
-    # Handle session events
-    @session.on("agent_state_changed")
-    def on_state_changed(ev):
-        """Log agent state changes."""
-        logger.info(f"State: {ev.old_state} -> {ev.new_state}")
-    
-    @session.on("user_started_speaking")
-    def on_user_speaking():
-        """Track when user starts speaking."""
-        logger.debug("User started speaking")
-    
-    @session.on("user_stopped_speaking")
-    def on_user_stopped():
-        """Track when user stops speaking."""
-        logger.debug("User stopped speaking")
+        
+    await session.generate_reply(instructions="")
 
 if __name__ == "__main__":
-    # Run the agent
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, agent_name="symrax"))
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
 
-   
+    cli.run_app(WorkerOptions(
+        entrypoint_fnc=entrypoint,
+        agent_name="harmony_agent"
+    ))
