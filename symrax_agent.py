@@ -1,7 +1,10 @@
 import logging
 from datetime import datetime
 import asyncio
+from datetime import datetime
+import asyncio
 import aiohttp
+import pytz
 import pytz
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -12,9 +15,133 @@ from livekit.agents import (
     cli,
     function_tool,
     RoomInputOptions
+    function_tool,
+    RoomInputOptions
 )
 from livekit.plugins import openai, silero, noise_cancellation
+from livekit.plugins import openai, silero, noise_cancellation
 from openai.types.beta.realtime.session import TurnDetection
+
+load_dotenv('.env')
+logger = logging.getLogger("harmony_agent")
+
+# --- Harmony Fertility Webhook Tools ---
+class HarmonyTools:
+    def __init__(self, phoneNum):
+        self.phoneNum = self._clean_phone_number(phoneNum)
+        self.webhook_url = "https://n8n.srv891045.hstgr.cloud/webhook/harmony"
+
+    def _clean_phone_number(self, phone_num: str) -> str:
+        if phone_num == "mock_user":
+            return "4168398090"
+        if phone_num.startswith('sip_'):
+            phone_num = phone_num[4:]
+        cleaned = ''.join(c for c in phone_num if c.isdigit() or c == '+')
+        return cleaned
+
+    @function_tool
+    async def get_slot(self, appointmentType: str, bookingDate: str = "false", bookingTime: str = "false") -> str:
+        """Check appointment availability for specified type, date and time."""
+        payload = {
+            "action": "get_slot",
+            "appointmentType": appointmentType,
+            "bookingDate": bookingDate,
+            "bookingTime": bookingTime,
+            "phoneNumber": self.phoneNum
+        }
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(self.webhook_url, json=payload) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        result = data.get("result", "No availability data received")
+                        logger.info(f"✅ Webhook get_slot completed: {result}")
+                        return result
+                    
+                    logger.warning(f"Webhook error: {response.status} for get_slot")
+                    return "Sorry, I'm having trouble checking availability right now."
+                
+        except asyncio.TimeoutError:
+            logger.error("Webhook timeout for get_slot")
+            return "The availability system is temporarily slow to respond."
+        except Exception as e:
+            logger.exception(f"Webhook call failed for get_slot: {e}")
+            return "The availability system is temporarily unavailable."
+
+async def entrypoint(ctx: JobContext):
+    """Main entry point for the telephony voice agent."""
+    await ctx.connect()
+
+    # Wait for participant (caller) to join and get their phone number
+    participant = await ctx.wait_for_participant()
+    caller_id = participant.identity
+    logger.info(f"Phone call connected from: {caller_id}")
+
+    # Enhanced check for unknown/blocked caller ID
+    unknown_patterns = [
+        "", "unknown", "anonymous", "private", "restricted", "unavailable", "blocked",
+        "sip_unavailable", "sip_unknown", "sip_anonymous", "sip_private", "sip_restricted", "sip_blocked"
+    ]
+    
+    caller_id_lower = caller_id.lower() if caller_id else ""
+    is_unknown = (
+        not caller_id or 
+        (caller_id.strip() == "" if caller_id else True) or 
+        caller_id_lower in unknown_patterns or
+        "unavailable" in caller_id_lower or
+        "unknown" in caller_id_lower or
+        "anonymous" in caller_id_lower or
+        "private" in caller_id_lower or
+        "restricted" in caller_id_lower or
+        "blocked" in caller_id_lower
+    )
+    
+    if is_unknown:
+        logger.warning(f"Unknown caller detected: '{caller_id}' - rejecting call")
+        try:
+            agent = Agent(
+                instructions="You are a rejection system. Say exactly: 'We're sorry, but we cannot assist calls from unknown or private numbers. Please call back from a recognized phone number.' Then end the call.",
+            )
+            
+            session = AgentSession(
+                vad=silero.VAD.load(),
+                llm=openai.realtime.RealtimeModel(
+                    model="gpt-4o-mini-realtime-preview",
+                    voice="shimmer", 
+                    temperature=0.7,
+                    turn_detection=TurnDetection(
+                        type="server_vad",
+                        threshold=1,
+                        silence_duration_ms=100,
+                        prefix_padding_ms=100,
+                        create_response=True,
+                        interrupt_response=False,
+                    )
+                ),
+            )
+            
+            await session.start(agent=agent, room=ctx.room)
+            await session.generate_reply(instructions="")
+        
+        except Exception as e:
+            logger.error(f"Rejection error: {e}")
+        finally:
+            await ctx.room.disconnect()
+            return
+
+    # Initialize tools with the caller's phone number
+    harmony_tools = HarmonyTools(phoneNum=caller_id)
+
+    # Static time - calculated once when agent starts
+    toronto_tz = pytz.timezone('America/Toronto')
+    current_time_toronto = datetime.now(toronto_tz)
+    formatted_time = current_time_toronto.strftime('%b %d, %Y %I:%M %p')
+
+    # Initialize the conversational agent with simplified instructions
+    agent = Agent(
+        instructions=f"""# Harmony Fertility AI Assistant
 
 load_dotenv('.env')
 logger = logging.getLogger("harmony_agent")
@@ -375,14 +502,25 @@ async def entrypoint(ctx: JobContext):
     )
 
     # Configure the voice processing pipeline
+        - Patients must provide consent before undergoing procedures.""",
+        tools=[
+            harmony_tools.get_slot, 
+            ],
+    )
+
+    # Configure the voice processing pipeline
     session = AgentSession(
+        vad=silero.VAD.load(),
         vad=silero.VAD.load(),
         llm=openai.realtime.RealtimeModel(
             model="gpt-4o-mini-realtime-preview",
             voice="shimmer",
             temperature=0.7,
             turn_detection=TurnDetection(
+            turn_detection=TurnDetection(
                 type="server_vad",
+                threshold=0.9,
+                silence_duration_ms=1500,
                 threshold=0.9,
                 silence_duration_ms=1500,
                 prefix_padding_ms=300,
@@ -393,11 +531,19 @@ async def entrypoint(ctx: JobContext):
     )
 
     # Start the agent session with noise cancellation
+
+    # Start the agent session with noise cancellation
     await session.start(
+        agent=agent, 
+        room=ctx.room, 
         agent=agent, 
         room=ctx.room, 
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVCTelephony(),
+        )
+    )
+        
+    await session.generate_reply(instructions="")
         )
     )
         
