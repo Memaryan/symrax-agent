@@ -17,7 +17,7 @@ from livekit.plugins import openai, silero, noise_cancellation
 from openai.types.beta.realtime.session import TurnDetection
 
 load_dotenv('.env')
-logger = logging.getLogger("harmony_agent")
+logger = logging.getLogger("symrax")
 
 # --- Harmony Fertility Webhook Tools ---
 class HarmonyTools:
@@ -114,6 +114,46 @@ class HarmonyTools:
         except Exception as e:
             logger.exception(f"Webhook call failed for book_slot: {e}")
             return "The booking system is temporarily unavailable."
+
+    @function_tool
+    async def update_slot(self, appointmentType: str, newBookingDate: str, newBookingTime: str) -> str:
+        """Update an existing appointment slot for specified type, new date, and new time."""
+        payload = {
+            "action": "book_slot",
+            "appointmentType": appointmentType,
+            "bookingDate": newBookingDate,
+            "bookingTime": newBookingTime,
+            "phoneNumber": self.phoneNum
+        }
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(self.webhook_url, json=payload) as response:
+                    if response.status == 200:
+                        data = await response.json()
+
+                        # Handle both list and dictionary responses
+                        if isinstance(data, list) and len(data) > 0:
+                            result = data[0].get("result", "No update confirmation received")
+                        elif isinstance(data, dict):
+                            result = data.get("result", "No update confirmation received")
+                        else:
+                            result = "Unexpected response format"
+                        
+                        logger.info(f"✅ Webhook update_slot completed: {result}")
+                        return result
+                    
+                    logger.warning(f"Webhook error: {response.status} for update_slot")
+                    return "Sorry, I'm having trouble updating the appointment right now."
+                
+        except asyncio.TimeoutError:
+            logger.error("Webhook timeout for update_slot")
+            return "The update system is temporarily slow to respond."
+        except Exception as e:
+            logger.exception(f"Webhook call failed for update_slot: {e}")
+            return "The update system is temporarily unavailable."
+
 
 async def entrypoint(ctx: JobContext):
     """Main entry point for the telephony voice agent."""
@@ -479,5 +519,5 @@ if __name__ == "__main__":
 
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint,
-        agent_name="symrax"
+        agent_name="symrax_agent"
     ))
