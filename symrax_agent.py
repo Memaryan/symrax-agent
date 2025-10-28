@@ -45,15 +45,25 @@ class HarmonyTools:
         }
 
         try:
-            timeout = aiohttp.ClientTimeout(total=10)
+            timeout = aiohttp.ClientTimeout(total=5)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(self.webhook_url, json=payload) as response:
                     if response.status == 200:
                         data = await response.json()
-                        result = data.get("result", "No availability data received")
+
+                        # Handle both list and dictionary responses
+                        if isinstance(data, list) and len(data) > 0:
+                            result = data[0].get("result", "No availability data received")
+                            # Extract from first item in list
+                        elif isinstance(data, dict):
+                            # Handle dictionary response
+                            result = data.get("result", "No availability data received")
+                        else:
+                            result = "Unexpected response format"
+                        
                         logger.info(f"✅ Webhook get_slot completed: {result}")
                         return result
-                    
+                        
                     logger.warning(f"Webhook error: {response.status} for get_slot")
                     return "Sorry, I'm having trouble checking availability right now."
                 
@@ -63,6 +73,47 @@ class HarmonyTools:
         except Exception as e:
             logger.exception(f"Webhook call failed for get_slot: {e}")
             return "The availability system is temporarily unavailable."
+
+    @function_tool
+    async def book_slot(self, appointmentType: str, bookingDate: str, bookingTime: str, name: str, notes: str = "") -> str:
+        """Book an appointment slot for specified type, date, time, and patient details."""
+        payload = {
+            "action": "book_slot",
+            "appointmentType": appointmentType,
+            "bookingDate": bookingDate,
+            "bookingTime": bookingTime,
+            "name": name,
+            "notes": notes,
+            "phoneNumber": self.phoneNum
+        }
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(self.webhook_url, json=payload) as response:
+                    if response.status == 200:
+                        data = await response.json()
+
+                        # Handle both list and dictionary responses
+                        if isinstance(data, list) and len(data) > 0:
+                            result = data[0].get("result", "No booking confirmation received")
+                        elif isinstance(data, dict):
+                            result = data.get("result", "No booking confirmation received")
+                        else:
+                            result = "Unexpected response format"
+                        
+                        logger.info(f"✅ Webhook book_slot completed: {result}")
+                        return result
+                    
+                    logger.warning(f"Webhook error: {response.status} for book_slot")
+                    return "Sorry, I'm having trouble booking the appointment right now."
+                
+        except asyncio.TimeoutError:
+            logger.error("Webhook timeout for book_slot")
+            return "The booking system is temporarily slow to respond."
+        except Exception as e:
+            logger.exception(f"Webhook call failed for book_slot: {e}")
+            return "The booking system is temporarily unavailable."
 
 async def entrypoint(ctx: JobContext):
     """Main entry point for the telephony voice agent."""
@@ -167,14 +218,15 @@ async def entrypoint(ctx: JobContext):
         - **NO REPETITIVE OFFERS**: Never offer the same time slot more than once for the same date
         - **NO SCHEDULE DISCLOSURE**: Never reveal day's availability status - only ask for preferred time
         - **STRICT DATE-FIRST FLOW**: Never ask for time until date is provided
-        - **NO APPOINTMENT CONFIRMATION**: Never confirm or book appointments - only check availability
         - **PROPER TIME CONVERSION**: Convert user time inputs to proper "HH:MM" format
         - **MISTAKE HANDLING**: If you make a mistake, apologize briefly and ask if they'd like to continue with their preferred date
         - **NO AVAILABILITY INVENTING**: NEVER suggest or mention availability without calling get_slot function first
         - **NO OPERATING HOURS CHECK**: Never check or mention operating hours - get_slot handles this automatically
         - **NO PAST DATE CHECK**: Never check if dates are in the past - get_slot handles this automatically
+        - **ENGLISH PARAMETERS**: All function parameters must be in English regardless of user's language
 
         ## Parameter Format Requirements
+        - **ALL PARAMETERS IN ENGLISH**: Convert all user inputs to English for function parameters
         - **DATE FORMAT**: Must be "yyyy-mm-dd" (e.g., "2025-10-27") - MUST use correct year from {formatted_time}
         - **TIME FORMAT**: Must be "HH:MM" in 24-hour format (e.g., "14:30" for 2:30 PM)
         - **TIME CONVERSION**: Convert user time inputs:
@@ -182,6 +234,7 @@ async def entrypoint(ctx: JobContext):
         - "3 pm" → "15:00" 
         - "10:30" → "10:30"
         - "2:15" → "14:15"
+        - **APPOINTMENT TYPES**: Always use English: "Consultation", "Follow-up", "Ultrasound"
         - **RELATIVE DATE HANDLING**: Convert relative dates to specific dates using current time with correct year
         - **NO WAITING MESSAGES**: Never say "I'll check", "one moment", "let me check", or similar phrases
 
@@ -192,26 +245,38 @@ async def entrypoint(ctx: JobContext):
 
         ### Appointment Availability Flow
         1. User mentions booking/appointment → Ask: "What type of appointment? We offer Consultation, Follow-up, or Ultrasound."
-        2. User provides appointment type → Ask: "What date are you looking for?"
+        2. User provides appointment type → Convert to English and IMMEDIATELY call get_slot with that date and time="false"
         3. User provides information:
-        - **If user provides specific date**: IMMEDIATELY call get_slot with that date and time="false"
-        - **If user provides relative date**: Convert to specific date using correct year and IMMEDIATELY call get_slot
+        - **If user provides specific date**: Convert to English format and IMMEDIATELY call get_slot with that date and time="false"
+        - **If user provides relative date**: Convert to specific date using correct year in English and IMMEDIATELY call get_slot
         - **If user provides no date/time**: IMMEDIATELY call get_slot with date="false" and time="false"
         - **If user provides only time**: Ask "What date would you like?" and DO NOT call get_slot until date is provided
-        - **If user provides both date and time**: Convert both and IMMEDIATELY call get_slot with both parameters
+        - **If user provides both date and time**: Convert both to English format and IMMEDIATELY call get_slot with both parameters
         4. Handle get_slot response:
         - **Specific time returned**: "The nearest available time on [date] is [time]. Would you like this time or would you prefer a different time?"
         - **Multiple times returned**: "We have availability at [read times naturally]. Which time works for you?"
         - **All day available**: "What time on [date] would you prefer?" (NEVER mention "entire day available")
         - **No availability**: "I'm sorry, [date] is fully booked. Would you like to try a different date?"
-        - **Time is available**: "That time is available. Would you like me to check another time or date?"
-        5. **If user provides time after date**: Convert to proper format and IMMEDIATELY call get_slot with date and converted time
-        6. **If user rejects offered time**: Ask "What specific time would you prefer?" → Wait for user input → Convert time → IMMEDIATELY call get_slot
-        7. **If you make a mistake**: Apologize briefly and ask "Would you like me to check availability for [corrected date]?"
+        - **Time is available**: "That time is available. Would you like to book this appointment?"
+        5. **If user provides time after date**: Convert to proper English format and IMMEDIATELY call get_slot with date and converted time
+        6. **If user rejects offered time**: Ask "What specific time would you prefer?" → Wait for user input → Convert time to English format → IMMEDIATELY call get_slot
+        7. **If user wants to book**: Begin Booking Flow
+
+        ### Booking Flow
+        1. **User confirms they want to book** → Begin collecting booking information
+        2. **Collect all required information** (order doesn't matter):
+        - **Name**: "May I have the patient's full name for the booking?"
+        - **Notes**: "Is there any specific concern or note you'd like to add for the appointment?" (optional)
+        3. **Wait until ALL required information is collected** (name is mandatory)
+        4. **Before booking, ALWAYS confirm**: "Let me confirm your booking: [appointmentType] for [name] on [date] at [time]. [Add: With note: [notes] if provided]. Is this correct?"
+        5. **User confirms details** → Convert all parameters to English format → IMMEDIATELY call book_slot with all collected information
+        6. **Handle book_slot response**:
+        - **Success**: "Your [appointmentType] has been confirmed for [date] at [time]. Thank you for booking with Harmony Fertility."
+        - **Error**: "I apologize, but there was an issue booking your appointment. [error message]"
 
         ## Critical Function Rules
         - **ALWAYS ASK APPOINTMENT TYPE FIRST** before checking availability
-        - **IMMEDIATE FUNCTION CALL**: Call get_slot instantly after collecting required information
+        - **IMMEDIATE FUNCTION CALL**: Call functions instantly after collecting required information
         - **NO WAITING MESSAGES**: Never say "let me check", "one moment", or similar phrases
         - **CORRECT YEAR USAGE**: Always use the current year from {formatted_time} when converting relative dates
         - **PROPER TIME FORMATTING**: Always convert user time inputs to "HH:MM" format
@@ -219,13 +284,15 @@ async def entrypoint(ctx: JobContext):
         - **OMIT YEAR IN DATES**: Only mention month and day unless year changes
         - **NO AVAILABILITY DISCLOSURE**: Never reveal if a day has "entire day available" or similar schedule information
         - **STRICT DATE REQUIREMENT**: Never ask for time or call get_slot with time parameter until date is provided
-        - **NO BOOKING/CONFIRMATION**: Never confirm or book appointments - only check availability
         - **MISTAKE RECOVERY**: If you make an error, apologize and ask if they want to continue with correct parameters
         - **NO AVAILABILITY INVENTING**: NEVER mention or suggest any availability without first calling get_slot function
         - **NO OPERATING HOURS/PAST DATE CHECKS**: Never check operating hours or past dates yourself - get_slot handles this
-        - **USE EXACT get_slot RESPONSES** - never modify or interpret availability
+        - **USE EXACT FUNCTION RESPONSES** - never modify or interpret function outputs
+        - **REQUIRED BOOKING INFORMATION**: Must collect name before calling book_slot, notes are optional
+        - **ALWAYS CONFIRM BOOKING DETAILS**: Repeat all booking details to user before calling book_slot
+        - **ENGLISH PARAMETERS**: All function parameters (appointmentType, bookingDate, bookingTime) must be in English format
 
-        **Remember:** You are the friendly front desk voice of Harmony Fertility Clinic, here to help patients with clear, accurate information and compassionate service. You only check availability - you do not book appointments. NEVER mention availability without calling get_slot function first. Let get_slot handle all date/time validation - you just convert and pass through the parameters.
+        **Remember:** You are the friendly front desk voice of Harmony Fertility Clinic, here to help patients with clear, accurate information and compassionate service. You check availability using get_slot and book appointments using book_slot when requested. All function parameters must be in English regardless of the user's language.
 
         # Harmony Fertility Knowledge Base
         ## 1. General Information
@@ -370,7 +437,8 @@ async def entrypoint(ctx: JobContext):
         - All fertility and pregnancy treatments follow current medical guidelines and standards.  
         - Patients must provide consent before undergoing procedures.""",
         tools=[
-            harmony_tools.get_slot, 
+            harmony_tools.get_slot,
+            harmony_tools.book_slot,
             ],
     )
 
